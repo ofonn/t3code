@@ -6,6 +6,7 @@ import {
   ClientSettingsSchema,
   ClientSettingsPatch,
   ClaudeSettings,
+  MuseSettings,
   DEFAULT_SERVER_SETTINGS,
   resolveProviderInstanceEnabled,
   ServerSettings,
@@ -189,6 +190,25 @@ describe("custom model settings", () => {
     expect(() =>
       decodeServerSettingsPatch({ providers: { codex: { customModels: [{ name: "no slug" }] } } }),
     ).toThrow();
+  });
+});
+
+describe("MuseSettings", () => {
+  it("uses the installed Muse executable for a newly added instance", () => {
+    expect(Schema.decodeUnknownSync(MuseSettings)({})).toEqual({
+      enabled: true,
+      binaryPath: "muse",
+      customModels: [],
+    });
+  });
+
+  it("preserves an explicit executable and custom model configuration", () => {
+    expect(
+      Schema.decodeUnknownSync(MuseSettings)({
+        binaryPath: "/opt/muse/bin/muse",
+        customModels: ["my-model"],
+      }),
+    ).toMatchObject({ binaryPath: "/opt/muse/bin/muse", customModels: ["my-model"] });
   });
 });
 

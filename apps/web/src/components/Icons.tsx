@@ -62,6 +62,18 @@ export const LinuxIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+export const MuseIcon: Icon = (props) => (
+  <svg {...props} viewBox="0 0 64 64" fill="none">
+    <path
+      d="M10 46 V22 L22 38 L32 24 L42 38 L54 22 V46"
+      stroke="currentColor"
+      strokeWidth="7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+
 export const GitHubIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 1024 1024" fill="none">
     <path

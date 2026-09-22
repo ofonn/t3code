@@ -1045,6 +1045,9 @@ it.layer(NodeServices.layer)("server settings", (it) => {
           grok: {
             enabled: false,
           },
+          muse: {
+            enabled: false,
+          },
           opencode: {
             enabled: false,
             serverUrl: "http://127.0.0.1:4096",

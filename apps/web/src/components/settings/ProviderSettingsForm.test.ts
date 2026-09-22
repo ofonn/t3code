@@ -20,6 +20,16 @@ describe("ProviderSettingsForm helpers", () => {
     ]);
   });
 
+  it("offers Muse with an editable executable path", () => {
+    const muse = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("muse")];
+    expect(muse).toBeDefined();
+    expect(deriveProviderSettingsFields(muse!).map((field) => field.key)).toEqual(["binaryPath"]);
+    expect(deriveProviderSettingsFields(muse!)[0]).toMatchObject({
+      label: "Binary path",
+      description: "Path to the Muse CLI binary.",
+    });
+  });
+
   it("sources labels and descriptions from schema annotations", () => {
     const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
     expect(opencode).toBeDefined();

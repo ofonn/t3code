@@ -63,7 +63,7 @@ describe("buildInitialMuseProviderSnapshot", () => {
           "max",
           "ultra",
         ]);
-        expect(descriptor.currentValue).toBe("high");
+        expect(descriptor.currentValue).toBe("max");
       }
     }),
   );

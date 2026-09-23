@@ -25,12 +25,12 @@ const MUSE_REASONING_EFFORT_OPTIONS = [
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },
   { id: "high", label: "High" },
-  { id: "xhigh", label: "Extra high" },
+  { id: "xhigh", label: "Extra High" },
   { id: "max", label: "Max" },
   { id: "ultra", label: "Ultra" },
 ] as const;
 
-export const MUSE_DEFAULT_REASONING_EFFORT = "high" as const;
+export const MUSE_DEFAULT_REASONING_EFFORT = "max" as const;
 
 export function buildMuseModelCapabilities() {
   return createModelCapabilities({

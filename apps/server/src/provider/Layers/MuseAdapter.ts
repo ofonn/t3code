@@ -56,6 +56,7 @@ import {
 import { makeMuseProtocol, type MuseMessage } from "../muse/MuseProtocol.ts";
 import { type MuseAdapterShape } from "../Services/MuseAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { MUSE_DEFAULT_REASONING_EFFORT } from "./MuseProvider.ts";
 
 const PROVIDER = "muse" as ProviderDriverKind;
 const MSP_CLIENT_NAME = "t3_code";
@@ -206,6 +207,23 @@ const decodeMspApprovalUpdated = Schema.decodeUnknownEffect(MspApprovalUpdated);
 const decodeMspApprovalResolved = Schema.decodeUnknownEffect(MspApprovalResolved);
 const decodeMspUserInputRequest = Schema.decodeUnknownEffect(MspUserInputRequest);
 const decodeMspUserInputSettled = Schema.decodeUnknownEffect(MspUserInputSettled);
+
+const MspSessionClosed = Schema.Struct({
+  reason: Schema.optional(Schema.String),
+  sessionId: Schema.String,
+});
+const decodeMspSessionClosed = Schema.decodeUnknownEffect(MspSessionClosed);
+
+/**
+ * Host-side rejection signals, matched on the message text because the
+ * protocol surface drops the JSON-RPC error code. `already_terminal`
+ * means the steered turn finished first; `is not loaded on this host`
+ * means the session idled out from under us.
+ */
+const isMspTerminalTurnError = (error: ProviderAdapterRequestError): boolean =>
+  error.detail.includes("already_terminal");
+const isMspSessionNotLoadedError = (error: ProviderAdapterRequestError): boolean =>
+  error.detail.includes("is not loaded on this host");
 
 interface MspTurnCompletion {
   readonly terminal: string;
@@ -558,7 +576,9 @@ interface MuseSessionContext {
   session: ProviderSession;
   readonly scope: Scope.Closeable;
   readonly protocol: MspProtocolHandle;
-  readonly mspSessionId: string;
+  mspSessionId: string;
+  /** False once the host unloads the session; the next send re-establishes it. */
+  sessionAlive: boolean;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   readonly turnWaiters: Map<
@@ -734,6 +754,33 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
         const target = sessions.get(threadId);
         if (!target || target.stopped) return;
         switch (message.method) {
+          case "session/closed": {
+            const decoded = yield* decodeMspSessionClosed(message.params).pipe(Effect.option);
+            if (Option.isNone(decoded)) return;
+            if (decoded.value.sessionId !== target.mspSessionId) return;
+            // The host unloads idle sessions without stopping. Mark ours
+            // dead so the next send re-establishes it, and release anything
+            // parked on it: a waiter for a turn on a closed session never
+            // settles, which wedges the in-flight count and steers every
+            // follow-up at a corpse. Unlike host exit the T3 session lives
+            // on, so no teardown and no exited event.
+            target.sessionAlive = false;
+            yield* failTurnWaiters(
+              target,
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "turn/start",
+                detail: "Muse closed the session while a turn was running.",
+              }),
+            );
+            yield* settlePendingApprovalsAsCancelled(target.pendingApprovals);
+            yield* settlePendingUserInputsAsEmpty(target);
+            yield* Effect.logDebug("Muse session closed by host; re-establishing on next send.", {
+              threadId: target.threadId,
+              sessionId: decoded.value.sessionId,
+            });
+            return;
+          }
           case "turn/completed": {
             const decoded = yield* decodeMspTurnCompleted(message.params).pipe(Effect.option);
             if (Option.isNone(decoded)) return;
@@ -1252,6 +1299,10 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
           // No approvalMode here: the host rejects explicit modes
           // above its sealed start ceiling, so full-access sessions
           // switch to allowAll with session/setApprovalMode below.
+          // A resumed session keeps its standing effort unless the
+          // selection names one; only fresh sessions fall back to the
+          // default, so a restart never clobbers a chosen level.
+          const resumedExistingSession = mspSessionId !== undefined;
           mspSessionId ??= (yield* protocol.request(
             "session/start",
             {
@@ -1274,9 +1325,10 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             );
           }
 
-          const startEffort = parseMuseReasoningEffort(
-            getModelSelectionStringOptionValue(museModelSelection, "reasoningEffort"),
-          );
+          const startEffort =
+            parseMuseReasoningEffort(
+              getModelSelectionStringOptionValue(museModelSelection, "reasoningEffort"),
+            ) ?? (resumedExistingSession ? undefined : MUSE_DEFAULT_REASONING_EFFORT);
           if (startEffort !== undefined) {
             yield* protocol.request(
               "session/setReasoningEffort",
@@ -1312,6 +1364,7 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             scope: sessionScope,
             protocol,
             mspSessionId,
+            sessionAlive: true,
             pendingApprovals,
             pendingUserInputs,
             turnWaiters: new Map(),
@@ -1355,6 +1408,94 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
         }).pipe(Effect.scoped),
       );
 
+    /**
+     * Reopen the host session after an idle close or an unloaded-session
+     * rejection, mirroring the startSession establishment: resume the
+     * stored cursor when the host still has it, else start fresh and
+     * reapply approval posture and effort. Steer targets from the dead
+     * session are cleared so the retry always opens a fresh turn.
+     */
+    const reestablishMspSession = (
+      ctx: MuseSessionContext,
+      modelSelection: Parameters<typeof getModelSelectionStringOptionValue>[0],
+    ) =>
+      Effect.gen(function* () {
+        const cursorSessionId = parseMuseResume(ctx.session.resumeCursor)?.sessionId;
+        let mspSessionId: string | undefined;
+        let resumed = false;
+        if (cursorSessionId !== undefined) {
+          const resumedExit = yield* Effect.exit(
+            ctx.protocol.request(
+              "session/resume",
+              {
+                commandId: yield* nextCommandId,
+                sessionId: cursorSessionId,
+                excludeItems: true,
+              },
+              MspSessionResumeResult,
+            ),
+          );
+          if (Exit.isSuccess(resumedExit)) {
+            mspSessionId = resumedExit.value.session.sessionId;
+            resumed = true;
+          } else {
+            yield* Effect.logDebug(
+              "Muse session resume failed during re-establish; starting fresh.",
+              {
+                cause: resumedExit.cause,
+              },
+            );
+          }
+        }
+        if (mspSessionId === undefined) {
+          mspSessionId = (yield* ctx.protocol.request(
+            "session/start",
+            {
+              commandId: yield* nextCommandId,
+              workspaceRoot: ctx.session.cwd,
+              modelId: museWireModelId(modelSelection?.model),
+            },
+            MspSessionStartResult,
+          )).session.sessionId;
+        }
+        ctx.mspSessionId = mspSessionId;
+        ctx.sessionAlive = true;
+        ctx.activeTurnId = undefined;
+        ctx.activeMspTurnId = undefined;
+        ctx.session = {
+          ...ctx.session,
+          resumeCursor: { schemaVersion: MUSE_RESUME_VERSION, sessionId: mspSessionId },
+          updatedAt: yield* nowIso,
+        };
+        if (museAutoAllow(ctx.session.runtimeMode)) {
+          yield* ctx.protocol.request(
+            "session/setApprovalMode",
+            {
+              commandId: yield* nextCommandId,
+              sessionId: mspSessionId,
+              mode: "allowAll",
+            },
+            MspSessionSetApprovalModeResult,
+          );
+        }
+        const startEffort =
+          parseMuseReasoningEffort(
+            getModelSelectionStringOptionValue(modelSelection, "reasoningEffort"),
+          ) ?? (resumed ? undefined : MUSE_DEFAULT_REASONING_EFFORT);
+        if (startEffort !== undefined) {
+          yield* ctx.protocol.request(
+            "session/setReasoningEffort",
+            {
+              commandId: yield* nextCommandId,
+              sessionId: mspSessionId,
+              reasoningEffort: startEffort,
+            },
+            Schema.Unknown,
+          );
+          ctx.reasoningEffort = startEffort;
+        }
+      });
+
     const sendTurn: MuseAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
@@ -1364,7 +1505,6 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
           input.threadId,
           Effect.gen(function* () {
             const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-            const turnId = steeringTurnId ?? TurnId.make(yield* randomUUID);
             ctx.promptsInFlight += 1;
 
             const parts: Array<Record<string, unknown>> = [];
@@ -1420,84 +1560,128 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             const requestedModel = turnModelSelection?.model;
             const requestedWireModel =
               requestedModel !== undefined ? museWireModelId(requestedModel) : undefined;
-            if (
-              requestedWireModel !== undefined &&
-              requestedWireModel !== museWireModelId(ctx.session.model)
-            ) {
-              yield* ctx.protocol.request(
-                "session/setModel",
-                {
-                  commandId: yield* nextCommandId,
-                  model: { modelId: requestedWireModel },
-                  sessionId: ctx.mspSessionId,
-                },
-                Schema.Unknown,
-              );
-              ctx.session = {
-                ...ctx.session,
-                model: requestedModel,
-                updatedAt: yield* nowIso,
-              };
-            }
             const requestedEffort = parseMuseReasoningEffort(
               getModelSelectionStringOptionValue(turnModelSelection, "reasoningEffort"),
             );
-            if (requestedEffort !== undefined && requestedEffort !== ctx.reasoningEffort) {
-              yield* ctx.protocol.request(
-                "session/setReasoningEffort",
-                {
-                  commandId: yield* nextCommandId,
-                  sessionId: ctx.mspSessionId,
-                  reasoningEffort: requestedEffort,
-                },
-                Schema.Unknown,
-              );
-              ctx.reasoningEffort = requestedEffort;
-            }
+            let steerAttempted = false;
+            let recovered = false;
+            // A submit runs twice at most: the first attempt steers when a
+            // prompt is already in flight. A steer the host reports as
+            // terminal, or a session that idled out from under us, retries
+            // once as a fresh turn (reopening the session first when it is
+            // gone). Anything else, and any second failure, surfaces.
+            // The stuck waiter behind a terminal steer is deliberately left
+            // alone: failing it could kill a legitimately running turn that
+            // only raced its completion notice, while the fallback turn it
+            // already produced keeps the thread moving.
+            const attemptSubmit = (allowSteer: boolean) =>
+              Effect.gen(function* () {
+                if (!ctx.sessionAlive) {
+                  yield* reestablishMspSession(ctx, turnModelSelection);
+                }
+                if (
+                  requestedWireModel !== undefined &&
+                  requestedWireModel !== museWireModelId(ctx.session.model)
+                ) {
+                  yield* ctx.protocol.request(
+                    "session/setModel",
+                    {
+                      commandId: yield* nextCommandId,
+                      model: { modelId: requestedWireModel },
+                      sessionId: ctx.mspSessionId,
+                    },
+                    Schema.Unknown,
+                  );
+                  ctx.session = {
+                    ...ctx.session,
+                    model: requestedModel,
+                    updatedAt: yield* nowIso,
+                  };
+                }
+                if (requestedEffort !== undefined && requestedEffort !== ctx.reasoningEffort) {
+                  yield* ctx.protocol.request(
+                    "session/setReasoningEffort",
+                    {
+                      commandId: yield* nextCommandId,
+                      sessionId: ctx.mspSessionId,
+                      reasoningEffort: requestedEffort,
+                    },
+                    Schema.Unknown,
+                  );
+                  ctx.reasoningEffort = requestedEffort;
+                }
 
-            ctx.activeTurnId = turnId;
-            ctx.session = { ...ctx.session, activeTurnId: turnId, updatedAt: yield* nowIso };
-            if (steeringTurnId === undefined) {
-              yield* offerRuntimeEvent({
-                type: "turn.started",
-                ...(yield* makeEventStamp()),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                turnId,
-                payload: { model: ctx.session.model },
+                const effectiveSteering = allowSteer ? steeringTurnId : undefined;
+                const attemptTurnId = effectiveSteering ?? TurnId.make(yield* randomUUID);
+                ctx.activeTurnId = attemptTurnId;
+                ctx.session = {
+                  ...ctx.session,
+                  activeTurnId: attemptTurnId,
+                  updatedAt: yield* nowIso,
+                };
+                if (effectiveSteering === undefined) {
+                  yield* offerRuntimeEvent({
+                    type: "turn.started",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId: attemptTurnId,
+                    payload: { model: ctx.session.model },
+                  });
+                }
+
+                const expectedMspTurnId =
+                  effectiveSteering !== undefined ? ctx.activeMspTurnId : undefined;
+                if (expectedMspTurnId !== undefined) {
+                  steerAttempted = true;
+                }
+                const mspTurnId =
+                  expectedMspTurnId !== undefined
+                    ? (yield* ctx.protocol.request(
+                        "turn/steer",
+                        {
+                          commandId: yield* nextCommandId,
+                          expectedTurnId: expectedMspTurnId,
+                          input: parts,
+                          sessionId: ctx.mspSessionId,
+                        },
+                        MspTurnSteerResult,
+                      )).turnId
+                    : (yield* ctx.protocol.request(
+                        "turn/start",
+                        {
+                          commandId: yield* nextCommandId,
+                          input: parts,
+                          sessionId: ctx.mspSessionId,
+                        },
+                        MspTurnStartResult,
+                      )).turnId;
+                ctx.activeMspTurnId = mspTurnId;
+                ctx.mspTurnToT3.set(mspTurnId, attemptTurnId);
+                ctx.t3TurnToMsp.set(attemptTurnId, mspTurnId);
+                let waiter = ctx.turnWaiters.get(mspTurnId);
+                if (!waiter) {
+                  waiter = yield* Deferred.make<MspTurnCompletion, ProviderAdapterRequestError>();
+                  ctx.turnWaiters.set(mspTurnId, waiter);
+                }
+                return { turnId: attemptTurnId, waiter };
               });
-            }
-
-            const mspTurnId =
-              steeringTurnId !== undefined && ctx.activeMspTurnId !== undefined
-                ? (yield* ctx.protocol.request(
-                    "turn/steer",
-                    {
-                      commandId: yield* nextCommandId,
-                      expectedTurnId: ctx.activeMspTurnId,
-                      input: parts,
-                      sessionId: ctx.mspSessionId,
-                    },
-                    MspTurnSteerResult,
-                  )).turnId
-                : (yield* ctx.protocol.request(
-                    "turn/start",
-                    {
-                      commandId: yield* nextCommandId,
-                      input: parts,
-                      sessionId: ctx.mspSessionId,
-                    },
-                    MspTurnStartResult,
-                  )).turnId;
-            ctx.activeMspTurnId = mspTurnId;
-            ctx.mspTurnToT3.set(mspTurnId, turnId);
-            ctx.t3TurnToMsp.set(turnId, mspTurnId);
-            let waiter = ctx.turnWaiters.get(mspTurnId);
-            if (!waiter) {
-              waiter = yield* Deferred.make<MspTurnCompletion, ProviderAdapterRequestError>();
-              ctx.turnWaiters.set(mspTurnId, waiter);
-            }
-            return { turnId, waiter };
+            return yield* attemptSubmit(true).pipe(
+              Effect.catchAll((error) =>
+                Effect.gen(function* () {
+                  if (!recovered && isMspSessionNotLoadedError(error)) {
+                    recovered = true;
+                    yield* reestablishMspSession(ctx, turnModelSelection);
+                    return yield* attemptSubmit(false);
+                  }
+                  if (!recovered && steerAttempted && isMspTerminalTurnError(error)) {
+                    recovered = true;
+                    return yield* attemptSubmit(false);
+                  }
+                  return yield* Effect.fail(error);
+                }),
+              ),
+            );
           }),
         ).pipe(
           Effect.tapError(() =>

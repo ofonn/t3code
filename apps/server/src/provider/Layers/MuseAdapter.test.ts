@@ -76,6 +76,19 @@ async function waitForFileContent(filePath: string, attempts = 120) {
   throw new Error(`Timed out waiting for file content at ${filePath}`);
 }
 
+async function waitForLogMethod(filePath: string, method: string, attempts = 200) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const frames = await readJsonLines(filePath);
+      if (frames.some((frame) => frame.method === method)) {
+        return frames;
+      }
+    } catch {}
+    await NodeTimersPromises.setTimeout(25);
+  }
+  throw new Error(`Timed out waiting for ${method} at ${filePath}`);
+}
+
 // Tests mutate `ServerSettingsService` mid-flight (e.g. setting
 // `providers.muse.binaryPath` to a mock MSP wrapper). The adapter captures
 // `museSettings` once at construction, so without a resolver the mutation
@@ -1208,6 +1221,74 @@ museAdapterTestLayer("MuseAdapter", (it) => {
     }),
   );
 
+  it.effect("syncs the default effort on fresh starts without an explicit choice", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("muse-effort-default-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "muse-msp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.log");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHostWrapper({ T3_MSP_REQUEST_LOG_PATH: requestLogPath }),
+      );
+      yield* settings.updateSettings({ providers: { muse: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("muse"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("muse"), model: "default" },
+      });
+
+      yield* Effect.promise(() => waitForFileContent(requestLogPath));
+      const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const effortSets = frames.filter((frame) => frame.method === "session/setReasoningEffort");
+      assert.equal(effortSets.length, 1);
+      const firstEffortSet = effortSets[0];
+      assert.isDefined(firstEffortSet);
+      assert.equal((firstEffortSet.params as Record<string, unknown>).reasoningEffort, "max");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("leaves standing effort alone when resuming without an explicit choice", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("muse-effort-resume-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "muse-msp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.log");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHostWrapper({ T3_MSP_REQUEST_LOG_PATH: requestLogPath }),
+      );
+      yield* settings.updateSettings({ providers: { muse: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("muse"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "prior-msp-session" },
+        modelSelection: { instanceId: ProviderInstanceId.make("muse"), model: "default" },
+      });
+
+      yield* Effect.promise(() => waitForFileContent(requestLogPath));
+      const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.isTrue(frames.some((frame) => frame.method === "session/resume"));
+      assert.isTrue(frames.every((frame) => frame.method !== "session/setReasoningEffort"));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("syncs reasoning effort changes per turn", () =>
     Effect.gen(function* () {
       const adapter = yield* MuseAdapter;
@@ -1250,10 +1331,11 @@ museAdapterTestLayer("MuseAdapter", (it) => {
       yield* Effect.promise(() => waitForFileContent(requestLogPath));
       const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
       const effortSets = frames.filter((frame) => frame.method === "session/setReasoningEffort");
-      assert.equal(effortSets.length, 1);
-      const firstEffortSet = effortSets[0];
-      assert.isDefined(firstEffortSet);
-      assert.equal((firstEffortSet.params as Record<string, unknown>).reasoningEffort, "medium");
+      assert.equal(effortSets.length, 2);
+      assert.deepStrictEqual(
+        effortSets.map((frame) => (frame.params as Record<string, unknown>).reasoningEffort),
+        ["max", "medium"],
+      );
 
       yield* adapter.stopSession(threadId);
     }),
@@ -1299,7 +1381,155 @@ museAdapterTestLayer("MuseAdapter", (it) => {
 
       yield* Effect.promise(() => waitForFileContent(requestLogPath));
       const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
-      assert.isTrue(frames.every((frame) => frame.method !== "session/setReasoningEffort"));
+      const effortSets = frames.filter((frame) => frame.method === "session/setReasoningEffort");
+      assert.equal(effortSets.length, 1);
+      assert.deepStrictEqual(
+        effortSets.map((frame) => (frame.params as Record<string, unknown>).reasoningEffort),
+        ["max"],
+      );
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("falls back to a fresh turn when steer hits a terminal turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("muse-steer-fallback-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "muse-msp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.log");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHostWrapper({
+          T3_MSP_REQUEST_LOG_PATH: requestLogPath,
+          T3_MSP_TURN_DELAY_MS: "2000",
+          T3_MSP_STEER_FAIL: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { muse: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("muse"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const firstSelection = {
+        instanceId: ProviderInstanceId.make("muse"),
+        model: "default",
+      };
+      const firstFiber = yield* Effect.fork(
+        adapter.sendTurn({
+          threadId,
+          input: "first",
+          attachments: [],
+          modelSelection: firstSelection,
+        }),
+      );
+      yield* Effect.promise(() => waitForLogMethod(requestLogPath, "turn/start"));
+      const second = yield* adapter.sendTurn({
+        threadId,
+        input: "second",
+        attachments: [],
+        modelSelection: firstSelection,
+      });
+      assert.isDefined(second.turnId);
+
+      const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const methods = frames.map((frame) => frame.method);
+      assert.isTrue(methods.includes("turn/steer"));
+      assert.equal(methods.filter((method) => method === "turn/start").length, 2);
+
+      yield* Fiber.interrupt(firstFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("re-establishes the session after an idle close", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("muse-session-close-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "muse-msp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.log");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHostWrapper({
+          T3_MSP_REQUEST_LOG_PATH: requestLogPath,
+          T3_MSP_CLOSE_SESSION: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { muse: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("muse"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      // The mock idle-closes the session 5ms after start; outwait it by
+      // two orders of magnitude so the close is always processed first.
+      // Real timers: this suite runs under TestClock, which Effect.sleep
+      // would wait on forever.
+      yield* Effect.promise(() => NodeTimersPromises.setTimeout(500));
+      const result = yield* adapter.sendTurn({
+        threadId,
+        input: "hello mock",
+        attachments: [],
+        modelSelection: { instanceId: ProviderInstanceId.make("muse"), model: "default" },
+      });
+      assert.isDefined(result.turnId);
+
+      const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.equal(frames.filter((frame) => frame.method === "session/start").length, 2);
+      const starts = frames.filter((frame) => frame.method === "turn/start");
+      assert.equal(starts.length, 1);
+      assert.equal((starts[0]?.params as Record<string, unknown>).sessionId, "mock-msp-session-2");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("retries once when a turn hits an unloaded session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("muse-session-retry-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "muse-msp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.log");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHostWrapper({
+          T3_MSP_REQUEST_LOG_PATH: requestLogPath,
+          T3_MSP_NOT_LOADED_ONCE: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { muse: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("muse"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const result = yield* adapter.sendTurn({
+        threadId,
+        input: "hello mock",
+        attachments: [],
+        modelSelection: { instanceId: ProviderInstanceId.make("muse"), model: "default" },
+      });
+      assert.isDefined(result.turnId);
+
+      const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.equal(frames.filter((frame) => frame.method === "turn/start").length, 2);
+      assert.equal(frames.filter((frame) => frame.method === "session/resume").length, 1);
 
       yield* adapter.stopSession(threadId);
     }),

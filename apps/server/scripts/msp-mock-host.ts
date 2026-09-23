@@ -13,6 +13,13 @@ const turnResponseText = process.env.T3_MSP_TURN_RESPONSE_TEXT ?? "hello from mo
 const turnDelayMs = Number(process.env.T3_MSP_TURN_DELAY_MS ?? "20");
 const turnFail = process.env.T3_MSP_TURN_FAIL === "1";
 const hangTurn = process.env.T3_MSP_TURN_HANG === "1";
+const steerFail = process.env.T3_MSP_STEER_FAIL === "1";
+const closeSession = process.env.T3_MSP_CLOSE_SESSION === "1";
+const notLoadedOnce = process.env.T3_MSP_NOT_LOADED_ONCE === "1";
+let notLoadedConsumed = false;
+let mockSessionSeq = 1;
+let closeArmed = true;
+const loadedSessions = new Set<string>();
 const emitApproval = process.env.T3_MSP_EMIT_APPROVAL === "1";
 const approvalMultistage = process.env.T3_MSP_APPROVAL_MULTISTAGE === "1";
 const approvalTimeout = process.env.T3_MSP_APPROVAL_TIMEOUT === "1";
@@ -238,8 +245,29 @@ lineReader.on("line", (line) => {
         return;
       }
       const requested = typeof params.sessionId === "string" ? params.sessionId : undefined;
+      const startedId = closeSession
+        ? `mock-msp-session-${mockSessionSeq++}`
+        : (requested ?? fixedSessionId);
+      if (closeSession) {
+        loadedSessions.add(startedId);
+      }
+      if (closeSession && closeArmed) {
+        closeArmed = false;
+        // Idle-close on the next tick so the start response is always
+        // processed before the close notification. Only the first session
+        // closes; the re-established replacement stays loaded.
+        // @effect-diagnostics-next-line globalTimers:off - Standalone Node mock host, not an Effect program.
+        NodeTimers.setTimeout(() => {
+          loadedSessions.delete(startedId);
+          notify("session/closed", {
+            reason: "idle",
+            sessionId: startedId,
+            viewCursor: nextCursor(),
+          });
+        }, 5);
+      }
       respond(id, {
-        session: mockSession(requested ?? fixedSessionId),
+        session: mockSession(startedId),
         viewCursor: "cursor-start-1",
       });
       return;
@@ -250,6 +278,10 @@ lineReader.on("line", (line) => {
         return;
       }
       const target = typeof params.sessionId === "string" ? params.sessionId : fixedSessionId;
+      if (closeSession && !loadedSessions.has(target)) {
+        respondError(id, -32002, "mock session resume rejected");
+        return;
+      }
       respond(id, {
         history: { items: [], mode: "none", snapshot: null },
         pendingRequests: [],
@@ -268,6 +300,16 @@ lineReader.on("line", (line) => {
       return;
     }
     case "turn/start": {
+      const startSessionId = typeof params.sessionId === "string" ? params.sessionId : "none";
+      if (notLoadedOnce && !notLoadedConsumed) {
+        notLoadedConsumed = true;
+        respondError(id, -32011, `session ${startSessionId} is not loaded on this host`);
+        return;
+      }
+      if (closeSession && !loadedSessions.has(startSessionId)) {
+        respondError(id, -32011, `session ${startSessionId} is not loaded on this host`);
+        return;
+      }
       const turnId = String(frame.id);
       currentTurnId = turnId;
       respond(id, {
@@ -456,6 +498,11 @@ lineReader.on("line", (line) => {
     }
     case "turn/steer": {
       const expected = typeof params.expectedTurnId === "string" ? params.expectedTurnId : "none";
+      if (steerFail) {
+        const steerCommandId = typeof params.commandId === "string" ? params.commandId : "none";
+        respondError(id, -32010, `turn/steer command ${steerCommandId} rejected: already_terminal`);
+        return;
+      }
       respond(id, { commandId: frame.id, status: "accepted", turnId: expected });
       return;
     }

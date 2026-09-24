@@ -1421,7 +1421,7 @@ museAdapterTestLayer("MuseAdapter", (it) => {
         instanceId: ProviderInstanceId.make("muse"),
         model: "default",
       };
-      const firstFiber = yield* Effect.fork(
+      const firstFiber = yield* Effect.forkChild(
         adapter.sendTurn({
           threadId,
           input: "first",
@@ -1489,7 +1489,9 @@ museAdapterTestLayer("MuseAdapter", (it) => {
       assert.equal(frames.filter((frame) => frame.method === "session/start").length, 2);
       const starts = frames.filter((frame) => frame.method === "turn/start");
       assert.equal(starts.length, 1);
-      assert.equal((starts[0]?.params as Record<string, unknown>).sessionId, "mock-msp-session-2");
+      const firstStart = starts[0];
+      assert.isDefined(firstStart);
+      assert.equal((firstStart.params as Record<string, unknown>).sessionId, "mock-msp-session-2");
 
       yield* adapter.stopSession(threadId);
     }),

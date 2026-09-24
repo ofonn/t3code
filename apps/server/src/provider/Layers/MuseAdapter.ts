@@ -1667,7 +1667,7 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
                 return { turnId: attemptTurnId, waiter };
               });
             return yield* attemptSubmit(true).pipe(
-              Effect.catchAll((error) =>
+              Effect.catch((error) =>
                 Effect.gen(function* () {
                   if (!recovered && isMspSessionNotLoadedError(error)) {
                     recovered = true;

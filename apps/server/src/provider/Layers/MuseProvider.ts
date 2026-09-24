@@ -94,9 +94,11 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
   if (!settings.enabled) return yield* buildInitialMuseProviderSnapshot(settings);
 
   const probe = yield* Effect.gen(function* () {
-    const spawn = yield* resolveSpawnCommand(settings.binaryPath, ["--version"], {
-      ...(environment ? { env: environment } : {}),
-    });
+    const spawn = yield* resolveSpawnCommand(
+      settings.binaryPath,
+      ["--version"],
+      environment ? { env: environment } : {},
+    );
     return yield* spawnAndCollect(
       settings.binaryPath,
       ChildProcess.make(spawn.command, spawn.args, {

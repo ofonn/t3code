@@ -63,6 +63,12 @@ const MSP_CLIENT_NAME = "t3_code";
 const MSP_CLIENT_VERSION = "0.0.0";
 const MUSE_RESUME_VERSION = 1 as const;
 /**
+ * First-output grace for a submitted turn. Healthy turns stream within
+ * seconds; a turn silent past this is a dead session, not a slow one,
+ * and is retried once on a fresh session.
+ */
+const MUSE_TURN_STALL_TIMEOUT_MS = 120_000;
+/**
  * The only model a default Muse session ever runs. Passed explicitly on
  * every session start so the choice never depends on the host or user
  * configuration default.
@@ -224,6 +230,13 @@ const isMspTerminalTurnError = (error: ProviderAdapterRequestError): boolean =>
   error.detail.includes("already_terminal");
 const isMspSessionNotLoadedError = (error: ProviderAdapterRequestError): boolean =>
   error.detail.includes("is not loaded on this host");
+
+const mspTurnStallError = () =>
+  new ProviderAdapterRequestError({
+    provider: PROVIDER,
+    method: "turn/start",
+    detail: `Muse turn produced no output within ${MUSE_TURN_STALL_TIMEOUT_MS / 1000} seconds; assuming a dead session.`,
+  });
 
 interface MspTurnCompletion {
   readonly terminal: string;
@@ -585,6 +598,12 @@ interface MuseSessionContext {
     string,
     Deferred.Deferred<MspTurnCompletion, ProviderAdapterRequestError>
   >;
+  /**
+   * First-output latch per T3 turn. Completed by any host output for the
+   * turn (items, deltas, approvals, user-input requests, completion) so
+   * the submit race can tell a slow turn from a dead session.
+   */
+  readonly turnProgress: Map<TurnId, Deferred.Deferred<void, never>>;
   readonly mspTurnToT3: Map<string, TurnId>;
   readonly t3TurnToMsp: Map<TurnId, string>;
   readonly itemKinds: Map<string, string>;
@@ -645,6 +664,15 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
       options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
 
     const sessions = new Map<ThreadId, MuseSessionContext>();
+    /**
+     * Closes that landed before their session registered. The host may
+     * close a session while startSession is still mid-flight, when no
+     * context exists to mark dead; stashing the id lets registration
+     * apply the close instead of dropping it. Entries are consumed on
+     * match; orphans (a start that never completes) never match a later
+     * session because ids are unique per start.
+     */
+    const pendingSessionCloses = new Set<string>();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
@@ -719,12 +747,26 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
         );
       });
 
+    const signalTurnProgress = (target: MuseSessionContext, turnId: TurnId | undefined) =>
+      Effect.gen(function* () {
+        if (turnId === undefined) return;
+        const progress = target.turnProgress.get(turnId);
+        if (progress === undefined) return;
+        yield* Deferred.succeed(progress, undefined).pipe(Effect.ignore);
+      });
+
     const failTurnWaiters = (ctx: MuseSessionContext, error: ProviderAdapterRequestError) =>
       Effect.gen(function* () {
         for (const waiter of ctx.turnWaiters.values()) {
           yield* Deferred.fail(waiter, error).pipe(Effect.ignore);
         }
         ctx.turnWaiters.clear();
+        // Release progress racers too: they proceed to the failed waiter
+        // and surface this error instead of stalling on the timeout.
+        for (const progress of ctx.turnProgress.values()) {
+          yield* Deferred.succeed(progress, undefined).pipe(Effect.ignore);
+        }
+        ctx.turnProgress.clear();
       });
 
     const settlePendingUserInputsAsEmpty = (ctx: MuseSessionContext) =>
@@ -752,7 +794,19 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
       Effect.gen(function* () {
         yield* logNative(threadId, message.method, message.params);
         const target = sessions.get(threadId);
-        if (!target || target.stopped) return;
+        if (!target || target.stopped) {
+          // No context to mark: either the session is still registering
+          // or it is already torn down. Stash closes for the former so a
+          // start that is mid-flight observes them on registration; drops
+          // for stopped sessions stay dropped as stale.
+          if (message.method === "session/closed" && !target) {
+            const decoded = yield* decodeMspSessionClosed(message.params).pipe(Effect.option);
+            if (Option.isSome(decoded)) {
+              pendingSessionCloses.add(decoded.value.sessionId);
+            }
+          }
+          return;
+        }
         switch (message.method) {
           case "session/closed": {
             const decoded = yield* decodeMspSessionClosed(message.params).pipe(Effect.option);
@@ -785,8 +839,13 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             const decoded = yield* decodeMspTurnCompleted(message.params).pipe(Effect.option);
             if (Option.isNone(decoded)) return;
             const completion = decoded.value;
+            const completedT3TurnId = target.mspTurnToT3.get(completion.turnId);
+            yield* signalTurnProgress(target, completedT3TurnId);
             const waiter = target.turnWaiters.get(completion.turnId);
             target.turnWaiters.delete(completion.turnId);
+            if (completedT3TurnId !== undefined) {
+              target.turnProgress.delete(completedT3TurnId);
+            }
             if (waiter === undefined) return;
             yield* Deferred.succeed(waiter, {
               terminal: completion.terminal,
@@ -805,6 +864,10 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             if (Option.isNone(decoded)) return;
             const item = decoded.value.item;
             target.itemKinds.set(item.itemId, item.kind);
+            const progressTurnId =
+              (item.turnId ? target.mspTurnToT3.get(item.turnId) : undefined) ??
+              target.activeTurnId;
+            yield* signalTurnProgress(target, progressTurnId);
             if (isMspHiddenItemKind(item.kind)) return;
             const lifecycle =
               message.method === "item/started"
@@ -812,9 +875,7 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
                 : message.method === "item/updated"
                   ? "item.updated"
                   : "item.completed";
-            const mappedTurnId =
-              (item.turnId ? target.mspTurnToT3.get(item.turnId) : undefined) ??
-              target.activeTurnId;
+            const mappedTurnId = progressTurnId;
             const itemTitle = mspItemTitle(item);
             const itemDetail = mspItemDetail(item);
             const itemData = mspItemData(item);
@@ -840,6 +901,7 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             const decoded = yield* decodeMspItemDelta(message.params).pipe(Effect.option);
             if (Option.isNone(decoded)) return;
             const delta = decoded.value;
+            yield* signalTurnProgress(target, target.activeTurnId);
             if (isMspHiddenItemKind(target.itemKinds.get(delta.itemId))) return;
             yield* offerRuntimeEvent({
               type: "content.delta",
@@ -877,6 +939,7 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             const mappedTurnId =
               (request.turnId ? target.mspTurnToT3.get(request.turnId) : undefined) ??
               target.activeTurnId;
+            yield* signalTurnProgress(target, mappedTurnId);
             const approvalToolName = request.subject.toolName ?? request.toolName;
             target.pendingApprovals.set(requestId, {
               approvalId: request.approvalId,
@@ -943,6 +1006,7 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             const mappedTurnId =
               (request.turnId ? target.mspTurnToT3.get(request.turnId) : undefined) ??
               target.activeTurnId;
+            yield* signalTurnProgress(target, mappedTurnId);
             const questions: ReadonlyArray<MspUserInputQuestion> = request.questions.map(
               (question) => ({
                 header: question.header,
@@ -1368,6 +1432,7 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
             pendingApprovals,
             pendingUserInputs,
             turnWaiters: new Map(),
+            turnProgress: new Map(),
             mspTurnToT3: new Map(),
             t3TurnToMsp: new Map(),
             itemKinds: new Map(),
@@ -1380,6 +1445,12 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
           };
           ctx = started;
           sessions.set(input.threadId, started);
+          if (pendingSessionCloses.delete(mspSessionId)) {
+            // The host closed this session before it finished registering;
+            // the notification had no context to mark, so apply it now and
+            // let the first send re-establish instead of firing at a corpse.
+            started.sessionAlive = false;
+          }
           sessionScopeTransferred = true;
 
           yield* offerRuntimeEvent({
@@ -1418,12 +1489,13 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
     const reestablishMspSession = (
       ctx: MuseSessionContext,
       modelSelection: Parameters<typeof getModelSelectionStringOptionValue>[0],
+      options?: { readonly fresh?: boolean },
     ) =>
       Effect.gen(function* () {
         const cursorSessionId = parseMuseResume(ctx.session.resumeCursor)?.sessionId;
         let mspSessionId: string | undefined;
         let resumed = false;
-        if (cursorSessionId !== undefined) {
+        if (cursorSessionId !== undefined && options?.fresh !== true) {
           const resumedExit = yield* Effect.exit(
             ctx.protocol.request(
               "session/resume",
@@ -1499,184 +1571,193 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
     const sendTurn: MuseAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+
+        const parts: Array<Record<string, unknown>> = [];
+        if (input.input?.trim()) {
+          parts.push({ type: "text", text: input.input.trim() });
+        }
+        if (input.attachments && input.attachments.length > 0) {
+          for (const attachment of input.attachments) {
+            // Muse ingests images only. Generic files reach the agent
+            // through the path line ProviderService puts in the prompt.
+            if (attachment.type !== "image") continue;
+            const attachmentPath = resolveAttachmentPath({
+              attachmentsDir: serverConfig.attachmentsDir,
+              attachment,
+            });
+            if (!attachmentPath) {
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "turn/start",
+                detail: `Invalid attachment id '${attachment.id}'.`,
+              });
+            }
+            const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "turn/start",
+                    detail: cause.message,
+                    cause,
+                  }),
+              ),
+            );
+            parts.push({
+              type: "image",
+              base64Data: Buffer.from(bytes).toString("base64"),
+              mediaType: attachment.mimeType,
+            });
+          }
+        }
+        if (parts.length === 0) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "Turn requires non-empty text or attachments.",
+          });
+        }
+
+        const turnModelSelection =
+          input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+        const requestedModel = turnModelSelection?.model;
+        const requestedWireModel =
+          requestedModel !== undefined ? museWireModelId(requestedModel) : undefined;
+        const requestedEffort = parseMuseReasoningEffort(
+          getModelSelectionStringOptionValue(turnModelSelection, "reasoningEffort"),
+        );
+        let steerAttempted = false;
+        let recovered = false;
+        let lastSubmittedTurnId: TurnId | undefined;
+        let lastSubmittedMspTurnId: string | undefined;
+        // A submit runs twice at most: the first attempt steers when a
+        // prompt is already in flight. A steer the host reports as
+        // terminal, a session that idled out from under us, or a turn
+        // that produces no output within the stall window retries once
+        // as a fresh turn (reopening the session first when it is gone
+        // or silent). Anything else, and any second failure, surfaces.
+        // The stuck waiter behind a terminal steer is deliberately left
+        // alone: failing it could kill a legitimately running turn that
+        // only raced its completion notice, while the fallback turn it
+        // already produced keeps the thread moving.
+        const attemptSubmit = (allowSteer: boolean, steeringTurnId: TurnId | undefined) =>
+          Effect.gen(function* () {
+            if (!ctx.sessionAlive) {
+              yield* reestablishMspSession(ctx, turnModelSelection);
+            }
+            if (
+              requestedWireModel !== undefined &&
+              requestedWireModel !== museWireModelId(ctx.session.model)
+            ) {
+              yield* ctx.protocol.request(
+                "session/setModel",
+                {
+                  commandId: yield* nextCommandId,
+                  model: { modelId: requestedWireModel },
+                  sessionId: ctx.mspSessionId,
+                },
+                Schema.Unknown,
+              );
+              ctx.session = {
+                ...ctx.session,
+                model: requestedModel,
+                updatedAt: yield* nowIso,
+              };
+            }
+            if (requestedEffort !== undefined && requestedEffort !== ctx.reasoningEffort) {
+              yield* ctx.protocol.request(
+                "session/setReasoningEffort",
+                {
+                  commandId: yield* nextCommandId,
+                  sessionId: ctx.mspSessionId,
+                  reasoningEffort: requestedEffort,
+                },
+                Schema.Unknown,
+              );
+              ctx.reasoningEffort = requestedEffort;
+            }
+
+            const effectiveSteering = allowSteer ? steeringTurnId : undefined;
+            const attemptTurnId = effectiveSteering ?? TurnId.make(yield* randomUUID);
+            ctx.activeTurnId = attemptTurnId;
+            ctx.session = {
+              ...ctx.session,
+              activeTurnId: attemptTurnId,
+              updatedAt: yield* nowIso,
+            };
+            if (effectiveSteering === undefined) {
+              yield* offerRuntimeEvent({
+                type: "turn.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId: attemptTurnId,
+                payload: { model: ctx.session.model },
+              });
+            }
+
+            const expectedMspTurnId =
+              effectiveSteering !== undefined ? ctx.activeMspTurnId : undefined;
+            if (expectedMspTurnId !== undefined) {
+              steerAttempted = true;
+            }
+            const mspTurnId =
+              expectedMspTurnId !== undefined
+                ? (yield* ctx.protocol.request(
+                    "turn/steer",
+                    {
+                      commandId: yield* nextCommandId,
+                      expectedTurnId: expectedMspTurnId,
+                      input: parts,
+                      sessionId: ctx.mspSessionId,
+                    },
+                    MspTurnSteerResult,
+                  )).turnId
+                : (yield* ctx.protocol.request(
+                    "turn/start",
+                    {
+                      commandId: yield* nextCommandId,
+                      input: parts,
+                      sessionId: ctx.mspSessionId,
+                    },
+                    MspTurnStartResult,
+                  )).turnId;
+            ctx.activeMspTurnId = mspTurnId;
+            ctx.mspTurnToT3.set(mspTurnId, attemptTurnId);
+            ctx.t3TurnToMsp.set(attemptTurnId, mspTurnId);
+            let waiter = ctx.turnWaiters.get(mspTurnId);
+            if (!waiter) {
+              waiter = yield* Deferred.make<MspTurnCompletion, ProviderAdapterRequestError>();
+              ctx.turnWaiters.set(mspTurnId, waiter);
+            }
+            let progress = ctx.turnProgress.get(attemptTurnId);
+            if (!progress) {
+              progress = yield* Deferred.make<void, never>();
+              ctx.turnProgress.set(attemptTurnId, progress);
+            }
+            lastSubmittedTurnId = attemptTurnId;
+            lastSubmittedMspTurnId = mspTurnId;
+            return { turnId: attemptTurnId, waiter, progress };
+          });
         // Submit under the thread lock so a concurrent steer always sees
-        // the recorded MSP turn id; the completion wait runs outside it.
-        const submitted = yield* withThreadLock(
+        // the recorded MSP turn id; the first-progress race and the
+        // completion wait run outside it.
+        let submitted = yield* withThreadLock(
           input.threadId,
           Effect.gen(function* () {
             const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
             ctx.promptsInFlight += 1;
-
-            const parts: Array<Record<string, unknown>> = [];
-            if (input.input?.trim()) {
-              parts.push({ type: "text", text: input.input.trim() });
-            }
-            if (input.attachments && input.attachments.length > 0) {
-              for (const attachment of input.attachments) {
-                // Muse ingests images only. Generic files reach the agent
-                // through the path line ProviderService puts in the prompt.
-                if (attachment.type !== "image") continue;
-                const attachmentPath = resolveAttachmentPath({
-                  attachmentsDir: serverConfig.attachmentsDir,
-                  attachment,
-                });
-                if (!attachmentPath) {
-                  return yield* new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "turn/start",
-                    detail: `Invalid attachment id '${attachment.id}'.`,
-                  });
-                }
-                const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new ProviderAdapterRequestError({
-                        provider: PROVIDER,
-                        method: "turn/start",
-                        detail: cause.message,
-                        cause,
-                      }),
-                  ),
-                );
-                parts.push({
-                  type: "image",
-                  base64Data: Buffer.from(bytes).toString("base64"),
-                  mediaType: attachment.mimeType,
-                });
-              }
-            }
-            if (parts.length === 0) {
-              return yield* new ProviderAdapterValidationError({
-                provider: PROVIDER,
-                operation: "sendTurn",
-                issue: "Turn requires non-empty text or attachments.",
-              });
-            }
-
-            const turnModelSelection =
-              input.modelSelection?.instanceId === boundInstanceId
-                ? input.modelSelection
-                : undefined;
-            const requestedModel = turnModelSelection?.model;
-            const requestedWireModel =
-              requestedModel !== undefined ? museWireModelId(requestedModel) : undefined;
-            const requestedEffort = parseMuseReasoningEffort(
-              getModelSelectionStringOptionValue(turnModelSelection, "reasoningEffort"),
-            );
-            let steerAttempted = false;
-            let recovered = false;
-            // A submit runs twice at most: the first attempt steers when a
-            // prompt is already in flight. A steer the host reports as
-            // terminal, or a session that idled out from under us, retries
-            // once as a fresh turn (reopening the session first when it is
-            // gone). Anything else, and any second failure, surfaces.
-            // The stuck waiter behind a terminal steer is deliberately left
-            // alone: failing it could kill a legitimately running turn that
-            // only raced its completion notice, while the fallback turn it
-            // already produced keeps the thread moving.
-            const attemptSubmit = (allowSteer: boolean) =>
-              Effect.gen(function* () {
-                if (!ctx.sessionAlive) {
-                  yield* reestablishMspSession(ctx, turnModelSelection);
-                }
-                if (
-                  requestedWireModel !== undefined &&
-                  requestedWireModel !== museWireModelId(ctx.session.model)
-                ) {
-                  yield* ctx.protocol.request(
-                    "session/setModel",
-                    {
-                      commandId: yield* nextCommandId,
-                      model: { modelId: requestedWireModel },
-                      sessionId: ctx.mspSessionId,
-                    },
-                    Schema.Unknown,
-                  );
-                  ctx.session = {
-                    ...ctx.session,
-                    model: requestedModel,
-                    updatedAt: yield* nowIso,
-                  };
-                }
-                if (requestedEffort !== undefined && requestedEffort !== ctx.reasoningEffort) {
-                  yield* ctx.protocol.request(
-                    "session/setReasoningEffort",
-                    {
-                      commandId: yield* nextCommandId,
-                      sessionId: ctx.mspSessionId,
-                      reasoningEffort: requestedEffort,
-                    },
-                    Schema.Unknown,
-                  );
-                  ctx.reasoningEffort = requestedEffort;
-                }
-
-                const effectiveSteering = allowSteer ? steeringTurnId : undefined;
-                const attemptTurnId = effectiveSteering ?? TurnId.make(yield* randomUUID);
-                ctx.activeTurnId = attemptTurnId;
-                ctx.session = {
-                  ...ctx.session,
-                  activeTurnId: attemptTurnId,
-                  updatedAt: yield* nowIso,
-                };
-                if (effectiveSteering === undefined) {
-                  yield* offerRuntimeEvent({
-                    type: "turn.started",
-                    ...(yield* makeEventStamp()),
-                    provider: PROVIDER,
-                    threadId: input.threadId,
-                    turnId: attemptTurnId,
-                    payload: { model: ctx.session.model },
-                  });
-                }
-
-                const expectedMspTurnId =
-                  effectiveSteering !== undefined ? ctx.activeMspTurnId : undefined;
-                if (expectedMspTurnId !== undefined) {
-                  steerAttempted = true;
-                }
-                const mspTurnId =
-                  expectedMspTurnId !== undefined
-                    ? (yield* ctx.protocol.request(
-                        "turn/steer",
-                        {
-                          commandId: yield* nextCommandId,
-                          expectedTurnId: expectedMspTurnId,
-                          input: parts,
-                          sessionId: ctx.mspSessionId,
-                        },
-                        MspTurnSteerResult,
-                      )).turnId
-                    : (yield* ctx.protocol.request(
-                        "turn/start",
-                        {
-                          commandId: yield* nextCommandId,
-                          input: parts,
-                          sessionId: ctx.mspSessionId,
-                        },
-                        MspTurnStartResult,
-                      )).turnId;
-                ctx.activeMspTurnId = mspTurnId;
-                ctx.mspTurnToT3.set(mspTurnId, attemptTurnId);
-                ctx.t3TurnToMsp.set(attemptTurnId, mspTurnId);
-                let waiter = ctx.turnWaiters.get(mspTurnId);
-                if (!waiter) {
-                  waiter = yield* Deferred.make<MspTurnCompletion, ProviderAdapterRequestError>();
-                  ctx.turnWaiters.set(mspTurnId, waiter);
-                }
-                return { turnId: attemptTurnId, waiter };
-              });
-            return yield* attemptSubmit(true).pipe(
+            return yield* attemptSubmit(true, steeringTurnId).pipe(
               Effect.catch((error) =>
                 Effect.gen(function* () {
                   if (!recovered && isMspSessionNotLoadedError(error)) {
                     recovered = true;
                     yield* reestablishMspSession(ctx, turnModelSelection);
-                    return yield* attemptSubmit(false);
+                    return yield* attemptSubmit(false, undefined);
                   }
                   if (!recovered && steerAttempted && isMspTerminalTurnError(error)) {
                     recovered = true;
-                    return yield* attemptSubmit(false);
+                    return yield* attemptSubmit(false, undefined);
                   }
                   return yield* Effect.fail(error);
                 }),
@@ -1692,6 +1773,34 @@ export function makeMuseAdapter(museSettings: MuseSettings, options?: MuseAdapte
         );
 
         return yield* Effect.gen(function* () {
+          // First-output race, outside the thread lock: a resumed zombie
+          // acknowledges the turn and then goes silent. Anything the host
+          // emits wins immediately; only total silence abandons the attempt
+          // for one fresh retry.
+          const awaitTurnProgress = (progress: Deferred.Deferred<void, never>) =>
+            Deferred.await(progress).pipe(Effect.timeoutOption(MUSE_TURN_STALL_TIMEOUT_MS));
+          if (Option.isNone(yield* awaitTurnProgress(submitted.progress))) {
+            if (recovered) {
+              return yield* Effect.fail(mspTurnStallError());
+            }
+            recovered = true;
+            // Abandon the zombie turn's latches so late output can never
+            // resolve them; mappings stay so anything the old turn emits
+            // keeps its original attribution. The stored cursor is poison
+            // (the host accepted it and went silent), so re-establish fresh
+            // without resuming it.
+            if (lastSubmittedMspTurnId !== undefined) {
+              ctx.turnWaiters.delete(lastSubmittedMspTurnId);
+            }
+            if (lastSubmittedTurnId !== undefined) {
+              ctx.turnProgress.delete(lastSubmittedTurnId);
+            }
+            yield* reestablishMspSession(ctx, turnModelSelection, { fresh: true });
+            submitted = yield* withThreadLock(input.threadId, attemptSubmit(false, undefined));
+            if (Option.isNone(yield* awaitTurnProgress(submitted.progress))) {
+              return yield* Effect.fail(mspTurnStallError());
+            }
+          }
           const completion = yield* Deferred.await(submitted.waiter);
           const entry = {
             input: input.input,

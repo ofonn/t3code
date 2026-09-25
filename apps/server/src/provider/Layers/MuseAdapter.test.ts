@@ -1462,6 +1462,7 @@ museAdapterTestLayer("MuseAdapter", (it) => {
         makeMockHostWrapper({
           T3_MSP_REQUEST_LOG_PATH: requestLogPath,
           T3_MSP_CLOSE_SESSION: "1",
+          T3_MSP_CLOSE_ON_NEXT_REQUEST: "1",
         }),
       );
       yield* settings.updateSettings({ providers: { muse: { binaryPath: wrapperPath } } });
@@ -1472,8 +1473,10 @@ museAdapterTestLayer("MuseAdapter", (it) => {
         cwd: process.cwd(),
         runtimeMode: "full-access",
       });
-      // The mock idle-closes the session 5ms after start; outwait it by
-      // two orders of magnitude so the close is always processed first.
+      // The mock idle-closes the session ahead of the next request, so the
+      // close notification always precedes its response on the wire and is
+      // processed before startSession returns. The brief wall-clock pause
+      // only absorbs scheduling jitter; ordering no longer depends on it.
       // Real timers: this suite runs under TestClock, which Effect.sleep
       // would wait on forever.
       yield* Effect.promise(() => NodeTimersPromises.setTimeout(500));
@@ -1532,6 +1535,95 @@ museAdapterTestLayer("MuseAdapter", (it) => {
       const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
       assert.equal(frames.filter((frame) => frame.method === "turn/start").length, 2);
       assert.equal(frames.filter((frame) => frame.method === "session/resume").length, 1);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("replaces a stalled resumed turn with a fresh session and completes", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("muse-stall-recovery-thread");
+      const logDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "muse-msp-log-")),
+      );
+      const requestLogPath = NodePath.join(logDir, "requests.log");
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHostWrapper({
+          T3_MSP_REQUEST_LOG_PATH: requestLogPath,
+          T3_MSP_TURN_HANG_ONCE: "1",
+        }),
+      );
+      yield* settings.updateSettings({ providers: { muse: { binaryPath: wrapperPath } } });
+
+      const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      // Resume a session the host accepts but never drives: the zombie
+      // the production host served after the original crash.
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("muse"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "mock-msp-session-99" },
+      });
+
+      const turnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "hello mock",
+          attachments: [],
+          modelSelection: { instanceId: ProviderInstanceId.make("muse"), model: "default" },
+        })
+        .pipe(Effect.forkChild);
+
+      // The first turn/start hangs; outwait the stall timeout on the test
+      // clock in small steps so an in-flight protocol ack never trips its
+      // own 30s timeout while the clock jumps.
+      yield* Effect.promise(() => waitForLogMethod(requestLogPath, "turn/start"));
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const seen = yield* Effect.promise(() => readJsonLines(requestLogPath));
+        if (seen.some((frame) => frame.method === "session/start")) break;
+        yield* TestClock.adjust("5 seconds");
+      }
+
+      const recoveryFrames = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.isTrue(recoveryFrames.some((frame) => frame.method === "session/start"));
+
+      const result = yield* Fiber.join(turnFiber);
+      assert.isDefined(result.turnId);
+      assert.equal(
+        (result.resumeCursor as Record<string, unknown>).sessionId,
+        "mock-msp-session-1",
+      );
+
+      const frames = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const starts = frames.filter((frame) => frame.method === "turn/start");
+      assert.equal(starts.length, 2);
+      const firstStart = starts[0];
+      const secondStart = starts[1];
+      assert.isDefined(firstStart);
+      assert.isDefined(secondStart);
+      assert.equal((firstStart.params as Record<string, unknown>).sessionId, "mock-msp-session-99");
+      assert.equal((secondStart.params as Record<string, unknown>).sessionId, "mock-msp-session-1");
+      // The zombie cursor is never resumed again: one resume at start,
+      // then a fresh session for the retry.
+      assert.equal(frames.filter((frame) => frame.method === "session/resume").length, 1);
+      assert.equal(frames.filter((frame) => frame.method === "session/start").length, 1);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const completed = runtimeEvents.find((event) => event.type === "turn.completed");
+      assert.isDefined(completed);
+      if (completed?.type === "turn.completed") {
+        assert.equal(completed.payload.state, "completed");
+      }
 
       yield* adapter.stopSession(threadId);
     }),

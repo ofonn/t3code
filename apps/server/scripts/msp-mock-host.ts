@@ -13,12 +13,16 @@ const turnResponseText = process.env.T3_MSP_TURN_RESPONSE_TEXT ?? "hello from mo
 const turnDelayMs = Number(process.env.T3_MSP_TURN_DELAY_MS ?? "20");
 const turnFail = process.env.T3_MSP_TURN_FAIL === "1";
 const hangTurn = process.env.T3_MSP_TURN_HANG === "1";
+const hangTurnOnce = process.env.T3_MSP_TURN_HANG_ONCE === "1";
 const steerFail = process.env.T3_MSP_STEER_FAIL === "1";
 const closeSession = process.env.T3_MSP_CLOSE_SESSION === "1";
+const closeOnNextRequest = process.env.T3_MSP_CLOSE_ON_NEXT_REQUEST === "1";
 const notLoadedOnce = process.env.T3_MSP_NOT_LOADED_ONCE === "1";
 let notLoadedConsumed = false;
+let hangTurnOnceConsumed = false;
 let mockSessionSeq = 1;
 let closeArmed = true;
+let pendingCloseId: string | undefined;
 const loadedSessions = new Set<string>();
 const emitApproval = process.env.T3_MSP_EMIT_APPROVAL === "1";
 const approvalMultistage = process.env.T3_MSP_APPROVAL_MULTISTAGE === "1";
@@ -65,6 +69,15 @@ const notify = (method: string, params: unknown) => {
 const nowIso = () => "2026-01-01T00:00:00.000Z";
 let cursorSeq = 2;
 const nextCursor = () => `cursor-${cursorSeq++}`;
+
+const emitIdleClose = (sessionId: string) => {
+  loadedSessions.delete(sessionId);
+  notify("session/closed", {
+    reason: "idle",
+    sessionId,
+    viewCursor: nextCursor(),
+  });
+};
 let currentTurnId: string | undefined;
 const settledTurns = new Set<string>();
 
@@ -224,6 +237,11 @@ lineReader.on("line", (line) => {
   const method = frame.method;
   const params = isRecord(frame.params) ? frame.params : {};
   if (typeof method !== "string" || id === undefined) return;
+  if (pendingCloseId !== undefined) {
+    const closingId = pendingCloseId;
+    pendingCloseId = undefined;
+    emitIdleClose(closingId);
+  }
   switch (method) {
     case "initialize": {
       respond(id, {
@@ -253,18 +271,20 @@ lineReader.on("line", (line) => {
       }
       if (closeSession && closeArmed) {
         closeArmed = false;
-        // Idle-close on the next tick so the start response is always
-        // processed before the close notification. Only the first session
-        // closes; the re-established replacement stays loaded.
-        // @effect-diagnostics-next-line globalTimers:off - Standalone Node mock host, not an Effect program.
-        NodeTimers.setTimeout(() => {
-          loadedSessions.delete(startedId);
-          notify("session/closed", {
-            reason: "idle",
-            sessionId: startedId,
-            viewCursor: nextCursor(),
-          });
-        }, 5);
+        if (closeOnNextRequest) {
+          // Deterministic close: defer until the next request so the close
+          // notification always precedes that request's response on the
+          // wire, with no timing assumption in the test.
+          pendingCloseId = startedId;
+        } else {
+          // Idle-close on the next tick so the start response is always
+          // processed before the close notification. Only the first session
+          // closes; the re-established replacement stays loaded.
+          // @effect-diagnostics-next-line globalTimers:off - Standalone Node mock host, not an Effect program.
+          NodeTimers.setTimeout(() => {
+            emitIdleClose(startedId);
+          }, 5);
+        }
       }
       respond(id, {
         session: mockSession(startedId),
@@ -319,7 +339,9 @@ lineReader.on("line", (line) => {
         status: "accepted",
         turnId,
       });
-      if (!hangTurn) {
+      const hangOnce = hangTurnOnce && !hangTurnOnceConsumed;
+      if (hangOnce) hangTurnOnceConsumed = true;
+      if (!hangTurn && !hangOnce) {
         // @effect-diagnostics-next-line globalTimers:off - Standalone Node mock host, not an Effect program.
         NodeTimers.setTimeout(() => {
           emitTurnHead(turnId);
